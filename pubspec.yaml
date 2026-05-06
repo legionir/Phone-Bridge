@@ -1,5 +1,5 @@
 name: phone_bridge
-description: A new Flutter project.
+description: Phone Bridge
 publish_to: 'none'
 
 version: 1.0.0+1
@@ -10,6 +10,12 @@ environment:
 dependencies:
   flutter:
     sdk: flutter
+  provider: ^6.1.1
+  shared_preferences: ^2.2.2
+  flutter_background_service: ^5.1.0
+  flutter_background_service_android: ^6.1.0
+  flutter_local_notifications: ^17.0.0
+  permission_handler: ^11.3.0
 
 dev_dependencies:
   flutter_test:
