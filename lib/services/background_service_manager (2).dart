@@ -1,11 +1,13 @@
 // lib/services/background_service_manager.dart
 import 'dart:async';
 import 'dart:convert';
+import 'dart:typed_data';
 import 'dart:ui';
 
 import 'package:flutter_background_service/flutter_background_service.dart';
 import 'package:flutter_background_service_android/flutter_background_service_android.dart';
 import 'package:flutter_local_notifications/flutter_local_notifications.dart';
+import 'package:pointycastle/export.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
 import '../models/bridge_config.dart';
@@ -16,57 +18,113 @@ const _kChannelId = 'phone_bridge_channel';
 const _kChannelName = 'Phone Bridge Service';
 const _kNotifId = 888;
 
+// کلید رمزگذاری — باید با CryptoService یکسان باشد
+final _aesKey = Uint8List.fromList([
+  0x42, 0x72, 0x69, 0x64, 0x67, 0x65, 0x41, 0x70,
+  0x70, 0x4B, 0x65, 0x79, 0x32, 0x30, 0x32, 0x34,
+  0x53, 0x65, 0x63, 0x72, 0x65, 0x74, 0x58, 0x59,
+  0x5A, 0x21, 0x40, 0x23, 0x24, 0x25, 0x5E, 0x26,
+]);
+
+Map<String, dynamic>? _decryptConfig(String encoded) {
+  try {
+    final raw = base64.decode(encoded.trim());
+    if (raw.length < 17) return null;
+
+    final iv = Uint8List.fromList(raw.sublist(0, 16));
+    final cipher = Uint8List.fromList(raw.sublist(16));
+
+    final params = ParametersWithIV(KeyParameter(_aesKey), iv);
+    final cbcCipher = CBCBlockCipher(AESEngine());
+    final paddedCipher =
+        PaddedBlockCipherImpl(PKCS7Padding(), cbcCipher);
+    paddedCipher.init(false, PaddedBlockCipherParameters(params, null));
+
+    final plain = paddedCipher.process(cipher);
+    final decoded = jsonDecode(utf8.decode(plain));
+    if (decoded is Map<String, dynamic>) return decoded;
+  } catch (_) {}
+  return null;
+}
+
+Future<BridgeConfig> _loadConfigFromPrefs() async {
+  try {
+    final prefs = await SharedPreferences.getInstance();
+    final authToken = prefs.getString('auth_token') ?? '';
+    final encryptedConfig = prefs.getString('encrypted_config') ?? '';
+
+    if (encryptedConfig.isNotEmpty) {
+      final decrypted = _decryptConfig(encryptedConfig);
+      if (decrypted != null) {
+        return BridgeConfig(
+          serverHost: decrypted['serverHost'] as String? ?? '',
+          serverPort: decrypted['serverPort'] as int? ?? 443,
+          wsPath: decrypted['wsPath'] as String? ?? '/api/bridge',
+          isSSL: decrypted['isSSL'] as bool? ?? true,
+          authToken: authToken,
+        );
+      }
+    }
+
+    final mapStr = prefs.getString('config_map');
+    if (mapStr != null) {
+      final map = jsonDecode(mapStr) as Map<String, dynamic>;
+      return BridgeConfig.fromMap(map).copyWith(authToken: authToken);
+    }
+  } catch (_) {}
+  return const BridgeConfig();
+}
+
 // ── Background entry point ────────────────────────────────
 
 @pragma('vm:entry-point')
 void onServiceStart(ServiceInstance service) async {
   DartPluginRegistrant.ensureInitialized();
 
-  // بارگذاری config از SharedPreferences
   BridgeConfig config = await _loadConfigFromPrefs();
   final bridge = BridgeService(config);
   final log = LogService.instance;
 
+  // این فلگ نشان می‌دهد آیا سرویس باید ادامه دهد
   bool shouldRun = true;
 
-  // Stop command
   service.on('stop').listen((_) async {
     shouldRun = false;
-    log.info('Stop command received.');
+    log.info('Stop command received from UI.');
     await bridge.stop();
+    // کمی صبر می‌کنیم تا cleanup کامل شود
+    await Future.delayed(const Duration(milliseconds: 500));
     await service.stopSelf();
   });
 
-  // Reconnect command
   service.on('reconnect').listen((_) async {
     if (!shouldRun) return;
     log.info('Reconnect command received.');
     await bridge.stop();
-    await bridge.start();
+    if (shouldRun) await bridge.start();
   });
 
-  // Config update command
   service.on('updateConfig').listen((data) async {
     if (data == null) return;
     try {
-      final newConfig = BridgeConfig.fromMap(
-        Map<String, dynamic>.from(data as Map),
-      );
+      final newConfig =
+          BridgeConfig.fromMap(Map<String, dynamic>.from(data as Map));
       bridge.updateConfig(newConfig);
-      // restart with new config
-      await bridge.stop();
+      if (bridge.isConnected || bridge.status == BridgeStatus.connecting) {
+        await bridge.stop();
+      }
       if (shouldRun) await bridge.start();
     } catch (_) {}
   });
 
-  // Start bridge
+  // شروع bridge
   if (config.isValid) {
     await bridge.start();
   } else {
-    log.warn('Config is not set. Please configure in Settings.');
+    log.warn('Config is not configured. Please go to Settings.');
   }
 
-  // Push stats to UI every 2 seconds
+  // Push stats — فقط وقتی shouldRun = true
   Timer.periodic(const Duration(seconds: 2), (timer) async {
     if (!shouldRun) {
       timer.cancel();
@@ -79,32 +137,26 @@ void onServiceStart(ServiceInstance service) async {
       'bytesIn': bridge.bytesIn,
       'bytesOut': bridge.bytesOut,
       'totalOpened': bridge.totalOpened,
-      'running': shouldRun,
+      'shouldRun': shouldRun,
     };
 
     if (service is AndroidServiceInstance) {
-      if (bridge.isConnected) {
-        await service.setForegroundNotificationInfo(
-          title: 'Bridge — Active',
-          content:
-              '● Connected  ·  ${bridge.activeSessions} sessions',
-        );
-      } else if (bridge.status == BridgeStatus.stopped) {
-        await service.setForegroundNotificationInfo(
-          title: 'Bridge',
-          content: '○ Stopped',
-        );
-      } else {
-        await service.setForegroundNotificationInfo(
-          title: 'Bridge',
-          content: '○ Reconnecting…',
-        );
-      }
+      final content = switch (bridge.status) {
+        BridgeStatus.connected =>
+          '● Connected  ·  ${bridge.activeSessions} sessions',
+        BridgeStatus.stopped => '○ Stopped',
+        BridgeStatus.error => '✕ Error',
+        _ => '○ Reconnecting…',
+      };
+      await service.setForegroundNotificationInfo(
+        title: 'Bridge',
+        content: content,
+      );
     }
 
     service.invoke('stats', stats);
 
-    // لاگ‌های جدید
+    // ارسال لاگ‌ها
     final logEntries = log.entries
         .map((e) => {
               'time': e.timeStr,
@@ -114,89 +166,6 @@ void onServiceStart(ServiceInstance service) async {
         .toList();
     service.invoke('logs', {'entries': logEntries});
   });
-}
-
-/// بارگذاری config از SharedPreferences در background isolate
-Future<BridgeConfig> _loadConfigFromPrefs() async {
-  try {
-    final prefs = await SharedPreferences.getInstance();
-    final authToken = prefs.getString('auth_token') ?? '';
-    final encryptedConfig = prefs.getString('encrypted_config') ?? '';
-    final enableForward = prefs.getBool('enable_forward') ?? false;
-    final forwardPort = prefs.getInt('forward_port') ?? 10808;
-
-    if (encryptedConfig.isNotEmpty) {
-      final decrypted = _decryptConfig(encryptedConfig);
-      if (decrypted != null) {
-        return BridgeConfig(
-          serverHost: decrypted['serverHost'] as String? ?? '',
-          serverPort: decrypted['serverPort'] as int? ?? 443,
-          wsPath: decrypted['wsPath'] as String? ?? '/api/bridge',
-          isSSL: decrypted['isSSL'] as bool? ?? true,
-          authToken: authToken,
-          enableForward: enableForward,
-          forwardPort: forwardPort,
-        );
-      }
-    }
-
-    final mapStr = prefs.getString('config_map');
-    if (mapStr != null) {
-      final map = jsonDecode(mapStr) as Map<String, dynamic>;
-      return BridgeConfig.fromMap(map).copyWith(
-        authToken: authToken,
-        enableForward: enableForward,
-        forwardPort: forwardPort,
-      );
-    }
-  } catch (_) {}
-  return const BridgeConfig();
-}
-
-/// رمزگشایی در background isolate (بدون import service)
-Map<String, dynamic>? _decryptInBackground(String encoded) {
-  try {
-    import_crypto:
-    {
-      // برای جلوگیری از circular import، مستقیم decrypt می‌کنیم
-      // این تابع باید با CryptoService هماهنگ باشد
-      final raw = base64.decode(encoded.trim());
-      if (raw.length < 17) return null;
-      // نکته: در background isolate باید pointycastle import شود
-      // اینجا از همان کلید استفاده می‌کنیم
-      return _aesDecrypt(raw);
-    }
-  } catch (_) {
-    return null;
-  }
-}
-
-Map<String, dynamic>? _aesDecrypt(List<int> raw) {
-  try {
-    // این import در background isolate کار می‌کند
-    // چون pointycastle pure dart است
-    import 'package:pointycastle/export.dart';
-    
-    final key = Uint8List.fromList([
-      0x42, 0x72, 0x69, 0x64, 0x67, 0x65, 0x41, 0x70,
-      0x70, 0x4B, 0x65, 0x79, 0x32, 0x30, 0x32, 0x34,
-      0x53, 0x65, 0x63, 0x72, 0x65, 0x74, 0x58, 0x59,
-      0x5A, 0x21, 0x40, 0x23, 0x24, 0x25, 0x5E, 0x26,
-    ]);
-    
-    final iv = Uint8List.fromList(raw.sublist(0, 16));
-    final cipher = Uint8List.fromList(raw.sublist(16));
-    
-    final params = ParametersWithIV(KeyParameter(key), iv);
-    final cbcCipher = CBCBlockCipher(AESEngine());
-    final paddedCipher = PaddedBlockCipherImpl(PKCS7Padding(), cbcCipher);
-    paddedCipher.init(false, PaddedBlockCipherParameters(params, null));
-    
-    final plain = paddedCipher.process(cipher);
-    final decoded = jsonDecode(utf8.decode(plain));
-    if (decoded is Map<String, dynamic>) return decoded;
-  } catch (_) {}
-  return null;
 }
 
 // ── Manager ───────────────────────────────────────────────
@@ -213,11 +182,11 @@ class BackgroundServiceManager {
         androidConfiguration: AndroidConfiguration(
           onStart: onServiceStart,
           isForegroundMode: true,
-          autoStart: false, // دستی کنترل می‌کنیم
+          autoStart: false,
           autoStartOnBoot: false,
           notificationChannelId: _kChannelId,
           initialNotificationTitle: 'Bridge',
-          initialNotificationContent: 'Starting…',
+          initialNotificationContent: 'Initializing…',
           foregroundServiceNotificationId: _kNotifId,
         ),
         iosConfiguration: IosConfiguration(
@@ -231,23 +200,21 @@ class BackgroundServiceManager {
 
   static Future<void> startService() async {
     await init();
-    final running = await _service.isRunning();
-    if (!running) {
+    if (!await _service.isRunning()) {
       await _service.startService();
     }
   }
 
-  static Future<bool> isRunning() => _service.isRunning();
-
-  /// توقف کامل سرویس
   static Future<void> stopService() async {
     _service.invoke('stop');
-    // صبر می‌کنیم تا سرویس متوقف شود
-    for (int i = 0; i < 20; i++) {
+    // polling تا متوقف شود
+    for (int i = 0; i < 25; i++) {
       await Future.delayed(const Duration(milliseconds: 200));
       if (!await _service.isRunning()) break;
     }
   }
+
+  static Future<bool> isRunning() => _service.isRunning();
 
   static void reconnect() => _service.invoke('reconnect');
 
@@ -256,14 +223,13 @@ class BackgroundServiceManager {
   }
 
   static Stream<Map<String, dynamic>> get statsStream =>
-      _service.on('stats').map((data) =>
-          data == null
-              ? <String, dynamic>{}
-              : Map<String, dynamic>.from(data));
+      _service.on('stats').map((data) => data == null
+          ? <String, dynamic>{}
+          : Map<String, dynamic>.from(data));
 
   static Stream<List<Map<String, dynamic>>> get logsStream =>
       _service.on('logs').map((data) {
-        if (data == null) return [];
+        if (data == null) return <Map<String, dynamic>>[];
         final entries = data['entries'] as List? ?? [];
         return entries
             .map((e) => Map<String, dynamic>.from(e as Map))

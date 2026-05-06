@@ -1,0 +1,14 @@
+{
+  "name": "bridge-keygen",
+  "version": "1.0.0",
+  "description": "Config string generator for Bridge app",
+  "main": "keygen.js",
+  "type": "module",
+  "scripts": {
+    "start": "node keygen.js",
+    "generate": "node keygen.js"
+  },
+  "dependencies": {
+    "readline-sync": "^1.4.10"
+  }
+}
